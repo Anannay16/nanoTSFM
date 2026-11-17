@@ -21,6 +21,10 @@ done
 # Interleave so the GPU trains while the CPUs score. Inference-only runs already have a
 # checkpoint, so pilot.sh skips straight to scoring them.
 bash exp/pilot.sh \
+  "power15-s1 configs/power15.yaml 1" \
+  "power15-s2 configs/power15.yaml 2" \
+  "power2-s7 configs/power2.yaml 7" \
+  "power3-s7 configs/power3.yaml 7" \
   "span16-s7 configs/span16.yaml 7" \
   "rec-s7-flip - 7" \
   "ctx2048-s7 configs/ctx2048.yaml 7" \
