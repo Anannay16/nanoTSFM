@@ -1,10 +1,12 @@
 """Print GIFT-Eval results for every scored run, grouped by config, plus a per-frequency breakdown.
 
 Usage: python3 exp/compare.py [runs_dir]
+       python3 exp/compare.py runs --worst rec-s7     # that run's 15 worst tasks
 """
 
 import json
 import math
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -29,11 +31,25 @@ def geo(xs):
     return math.exp(sum(math.log(x) for x in xs) / len(xs))
 
 
-runs = Path(sys.argv[1] if len(sys.argv) > 1 else "runs")
+args = sys.argv[1:]
+worst = args[args.index("--worst") + 1] if "--worst" in args else None
+args = [a for a in args if a not in ("--worst", worst)]
+runs = Path(args[0] if args else "runs")
+if worst:
+    rows = json.loads((runs / worst / "gift.json").read_text())["rows"]
+    rel = sorted(
+        ((r["metrics"]["mean_weighted_sum_quantile_loss"] / r["seasonal_naive"]["mean_weighted_sum_quantile_loss"],
+          r["dataset"], r["term"]) for r in rows), reverse=True)
+    print(f"Worst tasks for {worst} (relative CRPS; > 1 is worse than Seasonal Naive):")
+    for score, dataset, term in rel[:15]:
+        print(f"  {score:7.3f}  {dataset}/{term}")
+    sys.exit()
 by_config = defaultdict(list)
 for path in sorted(runs.glob("*/gift.json")):
     result = json.loads(path.read_text())
-    config = path.parent.name.rsplit("-s", 1)[0]
+    # "rec-s7" -> "rec"; "rec-s7-flip" -> "rec+flip" (seed dropped, inference variant kept)
+    match = re.fullmatch(r"(.*)-s\d+(-(.*))?", path.parent.name)
+    config = (match[1] + (f"+{match[3]}" if match[3] else "")) if match else path.parent.name
     groups = defaultdict(list)
     for row in result["rows"]:
         rel = row["metrics"]["mean_weighted_sum_quantile_loss"] / row["seasonal_naive"]["mean_weighted_sum_quantile_loss"]
@@ -56,7 +72,7 @@ print(f"{'run':<16}{'GIFT CRPS':>10}{'MASE':>8}{'GEP-Val':>9}")
 for config, items in by_config.items():
     for r in items:
         print(f"{r['run']:<16}{r['crps']:>10.4f}{r['mase']:>8.4f}{r['gep']:>9.4f}")
-print("\nMean over seeds (record to beat for the course point: 0.632; new record: <= 0.619)")
+print("\nMean over seeds (course point: verified mean < 0.6316; new record: <= 0.6186)")
 for config, items in by_config.items():
     crps = [r["crps"] for r in items]
     mean = sum(crps) / len(crps)

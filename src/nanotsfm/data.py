@@ -110,15 +110,20 @@ def frequency_group(freq: str) -> str:
 class Windows(Dataset):
     def __init__(
         self, dataset, context: int, horizon: int, count: int, seed: int, power=0.0,
-        freq_power=0.0,
+        freq_power=0.0, sign_flip=0.0, downsample=0.0,
     ):
         """Draw a source with weight (its series count) ** power, then a series from it.
 
         Power 0 weights sources equally, 1 weights every series equally. freq_power q then
         divides each source's weight by its frequency group's total weight ** q: q = 0 keeps
         the draw above exactly, q = 1 gives every frequency group the same share of windows.
+
+        Augmentations of the real series, off at 0 and drawing no random numbers then: with
+        probability sign_flip a window is negated; with probability downsample it is averaged
+        over k = 2, 3 or 4 consecutive steps, a coarser view of the same series.
         """
         self.context, self.horizon, self.count, self.seed = context, horizon, count, seed
+        self.sign_flip, self.downsample = sign_flip, downsample
         sources, freqs = {}, {}
         columns = dataset.column_names if hasattr(dataset, "column_names") else []
         freq_column = dataset["freq"] if freq_power and "freq" in columns else None
@@ -162,9 +167,22 @@ class Windows(Dataset):
                     replace=False,
                 )
             )
-            length = min(group.shape[1], self.context + self.horizon)
-            start = rng.integers(group.shape[1] - length + 1)
-            window = np.array(group[channels, start : start + length], copy=True)
+            factor = 1
+            if self.downsample and rng.random() < self.downsample:
+                factor = int(rng.integers(2, 5))
+                if group.shape[1] // factor <= self.horizon:
+                    factor = 1
+            length = min(group.shape[1] // factor, self.context + self.horizon)
+            start = rng.integers(group.shape[1] - length * factor + 1)
+            window = np.array(group[channels, start : start + length * factor], copy=True)
+            if factor > 1:
+                blocks = window.reshape(len(channels), length, factor)
+                counts = np.isfinite(blocks).sum(-1)
+                sums = np.where(np.isfinite(blocks), blocks, 0).sum(-1)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    window = np.where(counts > 0, sums / counts, np.nan).astype("float32")
+            if self.sign_flip and rng.random() < self.sign_flip:
+                window = -window
             cut = length - self.horizon
             if np.isfinite(window[:, :cut]).any() and np.isfinite(window[:, cut:]).any():
                 history = np.full((len(channels), self.context), np.nan, dtype="float32")

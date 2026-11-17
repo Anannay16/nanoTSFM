@@ -1,6 +1,7 @@
 """Train and validate nanoTSFM."""
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -45,7 +46,14 @@ def load_config(path: Path):
         "checkpoint_every",
         "source_power",
     }
-    optional = {"freq_power": 0.0}
+    optional = {
+        "freq_power": 0.0,  # 0 keeps the record's draw; 1 balances frequency groups
+        "mask_span_max": MASK_SPAN_MAX,  # longest run of hidden patches in training
+        "weight_decay": 0.01,  # AdamW's default, the record's value
+        "ema_decay": 0.0,  # 0 saves raw weights; e.g. 0.999 saves an exponential average
+        "sign_flip": 0.0,  # probability of negating a training window
+        "downsample": 0.0,  # probability of averaging a window over 2, 3 or 4 steps
+    }
     if not required <= set(settings) <= required | set(optional):
         raise ValueError(
             f"Training fields must be {sorted(required)}, plus optionally {sorted(optional)}"
@@ -63,6 +71,12 @@ def load_config(path: Path):
         power = settings[key]
         if isinstance(power, bool) or not isinstance(power, (int, float)) or not 0 <= power <= 4:
             raise ValueError(f"{key} must be a number from 0 to 4")
+    if not isinstance(settings["mask_span_max"], int) or not 1 <= settings["mask_span_max"] <= 64:
+        raise ValueError("mask_span_max must be an integer from 1 to 64")
+    for key, high in (("weight_decay", 1), ("ema_decay", 0.99999), ("sign_flip", 1), ("downsample", 1)):
+        value = settings[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= high:
+            raise ValueError(f"{key} must be a number from 0 to {high}")
     if not isinstance(settings["data"], str) or not settings["data"]:
         raise ValueError("data must name a dataset config or a local parquet folder")
     return model, settings
@@ -121,20 +135,22 @@ def validate(model, batches, device) -> float | None:
     return total / count
 
 
-def contiguous_patch_mask(shape, device) -> torch.Tensor:
+def contiguous_patch_mask(shape, device, span_max: int = MASK_SPAN_MAX) -> torch.Tensor:
     patches = shape[-1]
-    span = torch.randint(1, MASK_SPAN_MAX + 1, (*shape[:-1], 1), device=device)
+    span = torch.randint(1, span_max + 1, (*shape[:-1], 1), device=device)
     rate = torch.rand(*shape[:-1], 1, device=device) * MASK_RATE_MAX
     starts = torch.rand(shape, device=device) < rate / span
     position = torch.arange(patches, device=device)
-    latest = torch.where(starts, position, -MASK_SPAN_MAX).cummax(dim=-1).values
+    latest = torch.where(starts, position, -span_max).cummax(dim=-1).values
     return position - latest < span
 
 
-def next_patch_loss(model, sequence: torch.Tensor, series_ids: torch.Tensor) -> torch.Tensor:
+def next_patch_loss(
+    model, sequence: torch.Tensor, series_ids: torch.Tensor, span_max: int = MASK_SPAN_MAX
+) -> torch.Tensor:
     patch = model.config.patch_length
     batch, variates, length = sequence.shape
-    hidden = contiguous_patch_mask((batch, variates, length // patch), sequence.device)
+    hidden = contiguous_patch_mask((batch, variates, length // patch), sequence.device, span_max)
     observed = torch.isfinite(sequence).unflatten(-1, (-1, patch)).any(-1)
     hidden &= observed.cumsum(-1) > MIN_CONTEXT_PATCHES
     seen = (observed & ~hidden).cummax(-1).values
@@ -203,10 +219,17 @@ def train(
     torch.manual_seed(settings["seed"])
     torch.set_num_threads(min(torch.get_num_threads(), 4))
     model = NanoTSFM(model_config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=settings["learning_rate"])
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=settings["learning_rate"], weight_decay=settings["weight_decay"]
+    )
+    # Exponential moving average of the weights, saved in place of the raw weights.
+    params = [p for p in model.parameters()]
+    ema = [p.detach().clone() for p in params] if settings["ema_decay"] else None
     first_step, previous_seconds = 0, 0.0
     checkpoint = None
     if resume:
+        if ema is not None:
+            raise ValueError("Resume is not supported with ema_decay")
         _, checkpoint = load_checkpoint(resume)
         if checkpoint["data"] != identity or checkpoint["model_config"] != asdict(model_config):
             raise ValueError("Resume requires identical data and model configuration")
@@ -238,6 +261,8 @@ def train(
         settings["seed"],
         settings["source_power"],
         settings["freq_power"],
+        settings["sign_flip"],
+        settings["downsample"],
     )
     loader = DataLoader(
         Subset(windows, range(first_step * batch_size, len(windows))),
@@ -278,9 +303,25 @@ def train(
         """Training seconds so far; validation and checkpoint saving are off the clock."""
         return previous_seconds + time.monotonic() - started - paused
 
+    @contextlib.contextmanager
+    def averaged():
+        """Put the averaged weights in the model for validation and saving, then swap back."""
+        if ema is None:
+            yield
+            return
+        with torch.no_grad():
+            raw = [p.detach().clone() for p in params]
+            torch._foreach_copy_(params, ema)
+        try:
+            yield
+        finally:
+            with torch.no_grad():
+                torch._foreach_copy_(params, raw)
+
     def save(seconds):
         path = output / "checkpoint.pt"
-        save_checkpoint(path, model, optimizer, settings, step, seconds, identity)
+        with averaged():
+            save_checkpoint(path, model, optimizer, settings, step, seconds, identity)
 
     model.train()
     healthy = True
@@ -304,11 +345,15 @@ def train(
                     group["lr"] = learning_rate(step, settings["steps"], settings["learning_rate"])
                 optimizer.zero_grad(set_to_none=True)
                 with autocast:
-                    loss = next_patch_loss(model, sequence, series_ids)
+                    loss = next_patch_loss(model, sequence, series_ids, settings["mask_span_max"])
                 loss.backward()
                 norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 nonfinite |= ~torch.isfinite(norm)
                 optimizer.step()
+                if ema is not None:
+                    decay = min(settings["ema_decay"], (1 + step) / (10 + step))
+                    with torch.no_grad():
+                        torch._foreach_lerp_(ema, params, 1 - decay)
                 step += 1
                 windows_seen += batch_size
                 if step % LOG_EVERY == 0 or step == settings["steps"]:
@@ -323,7 +368,8 @@ def train(
                     seconds = elapsed()
                     pause = time.monotonic()
                     with autocast:
-                        validation = validate(model, batches, device)
+                        with averaged():
+                            validation = validate(model, batches, device)
                     record = {"step": step, "validation_loss": validation}
                     log.write(json.dumps(record) + "\n")
                     log.flush()

@@ -21,6 +21,9 @@ class ModelConfig:
     layers: int = 3  # causal time layers; one variate layer follows them
     heads: int = 4
     dropout: float = 0.0
+    # Inference-only options; they change forecast(), never the weights or training.
+    flip_symmetric: bool = False  # average f(x) with -f(-x), quantile order reversed
+    clamp_positive: bool = False  # no quantile below 0 when the observed history is >= 0
 
     def __post_init__(self):
         for key in (
@@ -167,19 +170,59 @@ def device_for(name: str) -> torch.device:
     return device
 
 
+class Ensemble(nn.Module):
+    """Several NanoTSFMs with one configuration; forecast() averages their quantiles."""
+
+    def __init__(self, config: ModelConfig, count: int):
+        super().__init__()
+        self.config = config
+        self.members = nn.ModuleList(NanoTSFM(config) for _ in range(count))
+
+
 def load_checkpoint(path: Path, device="cpu"):
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     if checkpoint.get("format_version") != 3:
         raise ValueError("Unsupported checkpoint version")
-    model = NanoTSFM(ModelConfig(**checkpoint["model_config"]))
-    model.load_state_dict(checkpoint["model"])
+    config = ModelConfig(**checkpoint["model_config"])
+    if checkpoint.get("members"):
+        model = Ensemble(config, len(checkpoint["members"]))
+        for member, state in zip(model.members, checkpoint["members"], strict=True):
+            member.load_state_dict(state)
+    else:
+        model = NanoTSFM(config)
+        model.load_state_dict(checkpoint["model"])
     model.to(device_for(str(device))).eval()
     return model, checkpoint
 
 
 @torch.inference_mode()
 def forecast(model, history: torch.Tensor, horizon: int, series_ids=None) -> torch.Tensor:
-    """Forecast [B,T] or [B,V,T] history, rolling out from median predictions if needed."""
+    """Forecast [B,T] or [B,V,T] history, rolling out from median predictions if needed.
+
+    With config.flip_symmetric the forecast is (f(x) - f(-x) with its quantiles reversed) / 2,
+    so negating the input exactly negates the forecast. With config.clamp_positive, series whose
+    observed history is nonnegative get no negative quantiles.
+    """
+    config = model.config
+    members = list(model.members) if isinstance(model, Ensemble) else [model]
+
+    def average(values):
+        return torch.stack([_forecast(m, values, horizon, series_ids) for m in members]).mean(0)
+
+    result = average(history)
+    if getattr(config, "flip_symmetric", False):
+        flipped = average(-history)
+        result = (result - flipped.flip(-1)) / 2
+    if getattr(config, "clamp_positive", False):
+        values = history.to(result.device, torch.float32)
+        observed = torch.isfinite(values)
+        lowest = torch.where(observed, values, float("inf")).amin(-1)
+        positive = (lowest >= 0) & observed.any(-1)
+        result = torch.where(positive[..., None, None], result.clamp_min(0), result)
+    return result
+
+
+def _forecast(model, history: torch.Tensor, horizon: int, series_ids=None) -> torch.Tensor:
     if history.ndim not in (2, 3) or history.shape[-1] == 0 or horizon <= 0:
         raise ValueError("Provide nonempty [B,T] or [B,V,T] history and a positive horizon")
     univariate = history.ndim == 2
