@@ -11,11 +11,11 @@ cd "$(dirname "$0")/.."
 # Inference-only variants: same weights, new forecast() options. No training needed.
 for spec in "flip flip_symmetric" "pos clamp_positive" "flippos flip_symmetric clamp_positive"; do
   read -r tag flags <<<"$spec"
-  [[ -d runs/rec-s7-$tag ]] || uv run --locked --extra gift python exp/reinfer.py runs/rec-s7 "runs/rec-s7-$tag" $flags
+  [[ -d runs/rec-s7-$tag ]] || uv run --locked --extra gift ${TORCH:+--extra $TORCH} python exp/reinfer.py runs/rec-s7 "runs/rec-s7-$tag" $flags
 done
 
 # Ensemble of round 1's three record seeds: is averaging models worth building into training?
-[[ -d runs/rec-ens3-s7 ]] || uv run --locked --extra gift python exp/ensemble.py runs/rec-ens3-s7 \
+[[ -d runs/rec-ens3-s7 ]] || uv run --locked --extra gift ${TORCH:+--extra $TORCH} python exp/ensemble.py runs/rec-ens3-s7 \
   runs/rec-s7 runs/rec-s1 runs/rec-s2
 
 # Interleave so the GPU trains while the CPUs score. Inference-only runs already have a
