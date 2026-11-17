@@ -94,22 +94,55 @@ def toy(split: str, seed: int = 7, series: int = 24, length: int = 512):
     return HFDataset.from_dict(rows)
 
 
+FREQUENCY_GROUPS = {
+    "S": "second", "T": "minute", "MIN": "minute", "H": "hour", "D": "day", "B": "day",
+    "W": "week", "M": "month", "MS": "month", "ME": "month", "Q": "quarter", "QS": "quarter",
+    "QE": "quarter", "A": "year", "AS": "year", "Y": "year", "YS": "year", "YE": "year",
+}
+
+
+def frequency_group(freq: str) -> str:
+    """Map a pandas frequency string such as '5T', 'H', 'W-SUN' or 'A-DEC' to a coarse group."""
+    alias = str(freq).split("-")[0].lstrip("0123456789").upper()
+    return FREQUENCY_GROUPS.get(alias, alias or "unknown")
+
+
 class Windows(Dataset):
-    def __init__(self, dataset, context: int, horizon: int, count: int, seed: int, power=0.0):
+    def __init__(
+        self, dataset, context: int, horizon: int, count: int, seed: int, power=0.0,
+        freq_power=0.0,
+    ):
         """Draw a source with weight (its series count) ** power, then a series from it.
 
-        Power 0 weights sources equally, 1 weights every series equally.
+        Power 0 weights sources equally, 1 weights every series equally. freq_power q then
+        divides each source's weight by its frequency group's total weight ** q: q = 0 keeps
+        the draw above exactly, q = 1 gives every frequency group the same share of windows.
         """
         self.context, self.horizon, self.count, self.seed = context, horizon, count, seed
-        sources = {}
-        for source, values in zip(dataset["source"], arrays(dataset), strict=True):
+        sources, freqs = {}, {}
+        columns = dataset.column_names if hasattr(dataset, "column_names") else []
+        freq_column = dataset["freq"] if freq_power and "freq" in columns else None
+        for row, (source, values) in enumerate(
+            zip(dataset["source"], arrays(dataset), strict=True)
+        ):
             if values.shape[1] > horizon:
                 sources.setdefault(source, []).append(values)
+                if freq_column is not None:
+                    freqs.setdefault(source, frequency_group(freq_column[row]))
         self.sources = list(sources.values())
         if not self.sources or min(context, horizon, count) <= 0:
             raise ValueError("No series longer than the horizon, or an invalid window/count")
         weights = np.array([len(source) for source in self.sources], dtype=float) ** power
-        self.weights = weights / weights.sum() if power else None
+        self.groups = None
+        if freq_power:
+            if freq_column is None:
+                raise ValueError("freq_power needs a 'freq' column in the training data")
+            self.groups = [freqs[name] for name in sources]
+            totals = {}
+            for group, weight in zip(self.groups, weights):
+                totals[group] = totals.get(group, 0.0) + weight
+            weights = weights / np.array([totals[g] for g in self.groups]) ** freq_power
+        self.weights = weights / weights.sum() if power or freq_power else None
 
     def __len__(self):
         return self.count
