@@ -170,27 +170,12 @@ def device_for(name: str) -> torch.device:
     return device
 
 
-class Ensemble(nn.Module):
-    """Several NanoTSFMs with one configuration; forecast() averages their quantiles."""
-
-    def __init__(self, config: ModelConfig, count: int):
-        super().__init__()
-        self.config = config
-        self.members = nn.ModuleList(NanoTSFM(config) for _ in range(count))
-
-
 def load_checkpoint(path: Path, device="cpu"):
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     if checkpoint.get("format_version") != 3:
         raise ValueError("Unsupported checkpoint version")
-    config = ModelConfig(**checkpoint["model_config"])
-    if checkpoint.get("members"):
-        model = Ensemble(config, len(checkpoint["members"]))
-        for member, state in zip(model.members, checkpoint["members"], strict=True):
-            member.load_state_dict(state)
-    else:
-        model = NanoTSFM(config)
-        model.load_state_dict(checkpoint["model"])
+    model = NanoTSFM(ModelConfig(**checkpoint["model_config"]))
+    model.load_state_dict(checkpoint["model"])
     model.to(device_for(str(device))).eval()
     return model, checkpoint
 
@@ -204,14 +189,9 @@ def forecast(model, history: torch.Tensor, horizon: int, series_ids=None) -> tor
     observed history is nonnegative get no negative quantiles.
     """
     config = model.config
-    members = list(model.members) if isinstance(model, Ensemble) else [model]
-
-    def average(values):
-        return torch.stack([_forecast(m, values, horizon, series_ids) for m in members]).mean(0)
-
-    result = average(history)
+    result = _forecast(model, history, horizon, series_ids)
     if getattr(config, "flip_symmetric", False):
-        flipped = average(-history)
+        flipped = _forecast(model, -history, horizon, series_ids)
         result = (result - flipped.flip(-1)) / 2
     if getattr(config, "clamp_positive", False):
         values = history.to(result.device, torch.float32)

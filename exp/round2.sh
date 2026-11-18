@@ -14,9 +14,6 @@ for spec in "flip flip_symmetric" "pos clamp_positive" "flippos flip_symmetric c
   [[ -d runs/rec-s7-$tag ]] || uv run --locked --extra gift ${TORCH:+--extra $TORCH} python exp/reinfer.py runs/rec-s7 "runs/rec-s7-$tag" $flags
 done
 
-# Ensemble of round 1's three record seeds: is averaging models worth building into training?
-[[ -d runs/rec-ens3-s7 ]] || uv run --locked --extra gift ${TORCH:+--extra $TORCH} python exp/ensemble.py runs/rec-ens3-s7 \
-  runs/rec-s7 runs/rec-s1 runs/rec-s2
 
 # Interleave so the GPU trains while the CPUs score. Inference-only runs already have a
 # checkpoint, so pilot.sh skips straight to scoring them.
@@ -33,5 +30,4 @@ bash exp/pilot.sh \
   "rec-s7-flippos - 7" \
   "wd01-s7 configs/wd01.yaml 7" \
   "aug-s7 configs/aug.yaml 7" \
-  "rec-ens3-s7 - 7" \
   "patch16-s7 configs/patch16.yaml 7"

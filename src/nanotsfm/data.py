@@ -95,9 +95,24 @@ def toy(split: str, seed: int = 7, series: int = 24, length: int = 512):
 
 
 FREQUENCY_GROUPS = {
-    "S": "second", "T": "minute", "MIN": "minute", "H": "hour", "D": "day", "B": "day",
-    "W": "week", "M": "month", "MS": "month", "ME": "month", "Q": "quarter", "QS": "quarter",
-    "QE": "quarter", "A": "year", "AS": "year", "Y": "year", "YS": "year", "YE": "year",
+    "S": "second",
+    "T": "minute",
+    "MIN": "minute",
+    "H": "hour",
+    "D": "day",
+    "B": "day",
+    "W": "week",
+    "M": "month",
+    "MS": "month",
+    "ME": "month",
+    "Q": "quarter",
+    "QS": "quarter",
+    "QE": "quarter",
+    "A": "year",
+    "AS": "year",
+    "Y": "year",
+    "YS": "year",
+    "YE": "year",
 }
 
 
@@ -109,8 +124,16 @@ def frequency_group(freq: str) -> str:
 
 class Windows(Dataset):
     def __init__(
-        self, dataset, context: int, horizon: int, count: int, seed: int, power=0.0,
-        freq_power=0.0, sign_flip=0.0, downsample=0.0,
+        self,
+        dataset,
+        context: int,
+        horizon: int,
+        count: int,
+        seed: int,
+        power=0.0,
+        freq_power=0.0,
+        sign_flip=0.0,
+        downsample=0.0,
     ):
         """Draw a source with weight (its series count) ** power, then a series from it.
 
@@ -144,7 +167,7 @@ class Windows(Dataset):
                 raise ValueError("freq_power needs a 'freq' column in the training data")
             self.groups = [freqs[name] for name in sources]
             totals = {}
-            for group, weight in zip(self.groups, weights):
+            for group, weight in zip(self.groups, weights, strict=True):
                 totals[group] = totals.get(group, 0.0) + weight
             weights = weights / np.array([totals[g] for g in self.groups]) ** freq_power
         self.weights = weights / weights.sum() if power or freq_power else None

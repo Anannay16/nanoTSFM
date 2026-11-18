@@ -73,7 +73,12 @@ def load_config(path: Path):
             raise ValueError(f"{key} must be a number from 0 to 4")
     if not isinstance(settings["mask_span_max"], int) or not 1 <= settings["mask_span_max"] <= 64:
         raise ValueError("mask_span_max must be an integer from 1 to 64")
-    for key, high in (("weight_decay", 1), ("ema_decay", 0.99999), ("sign_flip", 1), ("downsample", 1)):
+    for key, high in (
+        ("weight_decay", 1),
+        ("ema_decay", 0.99999),
+        ("sign_flip", 1),
+        ("downsample", 1),
+    ):
         value = settings[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= high:
             raise ValueError(f"{key} must be a number from 0 to {high}")
